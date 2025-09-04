@@ -13,6 +13,8 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import threading, queue
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.shortcuts import print_formatted_text
 import sys
 
 init(autoreset=True, convert=True, wrap=True)
@@ -45,8 +47,7 @@ def log(msg, level="info"):
     elif level == "error":
         color = Fore.RED
 
-    with print_lock:
-        print(f"{color}{prefix} {msg}{Style.RESET_ALL}", flush=True)
+    print_formatted_text(ANSI(f"{color}{prefix} {msg}{Style.RESET_ALL}"))
 
 
 def suppress_traceback(exctype, value, tb):
@@ -107,7 +108,7 @@ def load_config(config_path="config.ini"):
         "vpn_user": config["settings"].get("vpn_user", ""),
         "vpn_pass": config["settings"].get("vpn_pass", ""),
         "vpn_check_interval_sec": int(config["settings"].get("vpn_check_interval_sec", 60)),
-        "max_workers": int(config["settings"].get("max_workers", multiprocessing.cpu_count() - 1 or 1)),
+        "cpu_workers": max(1, int(config["settings"].get("cpu_workers", 1))),
         "check_settings_interval_min": int(config["settings"].get("check_settings_interval_min", 5)),
     }
 
@@ -149,51 +150,35 @@ def is_file_stable(path, min_stable_time):
 
 
 def process_ip_folder(args):
-    messages = []
     date_folder_path, ip_folder, ip, dest_base, min_stable_time = args
+    moved = 0
+    messages = []
+    exclude_pattern = re.compile(r"^index\d+(\.bin)?$", re.IGNORECASE)
     src_ip_path = os.path.join(date_folder_path, ip_folder)
     if not os.path.isdir(src_ip_path):
         return 0, messages
-
-    moved = 0
-    exclude_pattern = re.compile(r"^index\d+(\.bin)?$", re.IGNORECASE)
-
     try:
         filenames = os.listdir(src_ip_path)
     except Exception as e:
-        messages.append(f"Ошибка чтения каталога {src_ip_path}: {e}")
+        messages.append(f"Ошибка чтения {src_ip_path}: {e}")
         return 0, messages
-
     for filename in filenames:
         if exclude_pattern.match(filename):
             continue
-
         file_path = os.path.join(src_ip_path, filename)
-        if not os.path.isfile(file_path):
+        if not os.path.isfile(file_path) or not is_file_stable(file_path, min_stable_time):
             continue
-
-        if not is_file_stable(file_path, min_stable_time):
-            continue
-
-        date_folder_name = os.path.basename(date_folder_path)
-        dst_dir = os.path.join(dest_base, date_folder_name, ip_folder)
-        try:
-            os.makedirs(dst_dir, exist_ok=True)
-        except Exception as e:
-            messages.append(f"Ошибка создания папки {dst_dir}: {e}")
-            continue
-
+        dst_dir = os.path.join(dest_base, os.path.basename(date_folder_path), ip_folder)
+        os.makedirs(dst_dir, exist_ok=True)
         dst_file_path = os.path.join(dst_dir, filename)
         try:
             if os.path.exists(dst_file_path):
                 os.remove(dst_file_path)
-
             shutil.move(file_path, dst_file_path)
-            messages.append(f"Перемещён файл: {file_path} → {dst_file_path}")
             moved += 1
+            messages.append(f"Перемещён файл: {file_path} → {dst_file_path}")
         except Exception as e:
             messages.append(f"Ошибка при перемещении {file_path}: {e}")
-
     return moved, messages
 
 
@@ -202,36 +187,32 @@ def process_path(base_path, ip, dest, min_stable_time):
     all_messages = []
     if not os.path.isdir(base_path):
         return 0, all_messages
-
     try:
         date_folders = os.listdir(base_path)
     except Exception as e:
-        all_messages.append(f"Ошибка чтения папок в {base_path}: {e}")
+        all_messages.append(f"Ошибка чтения папок {base_path}: {e}")
         return 0, all_messages
-
     tasks = []
     for date_folder in date_folders:
         date_folder_path = os.path.join(base_path, date_folder)
         if not os.path.isdir(date_folder_path):
             continue
-
         try:
             ip_folders = os.listdir(date_folder_path)
         except Exception as e:
-            all_messages.append(f"Ошибка чтения папок в {date_folder_path}: {e}")
+            all_messages.append(f"Ошибка чтения папок {date_folder_path}: {e}")
             continue
-
         for ip_folder in ip_folders:
             if not ip_folder.startswith(ip):
                 continue
             tasks.append((date_folder_path, ip_folder, ip, dest, min_stable_time))
-
-    with ThreadPoolExecutor() as thread_executor:
-        results = list(thread_executor.map(process_ip_folder, tasks))
-        for moved, messages in results:
-            total_moved += moved
-            all_messages.extend(messages)
-
+    # Многопроцессный запуск для каждой папки
+    moved_results = []
+    with ProcessPoolExecutor() as executor:
+        moved_results = list(executor.map(process_ip_folder, tasks))
+    for moved, messages in moved_results:
+        total_moved += moved
+        all_messages.extend(messages)
     return total_moved, all_messages
 
 
@@ -250,15 +231,24 @@ def last_modification_time(path):
 
 def is_converter_process_running(bat_path):
     bat_path_norm = os.path.normcase(os.path.abspath(bat_path))
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+    for proc in psutil.process_iter(['name','cmdline']):
         try:
-            if proc.info['name'] and proc.info['name'].lower() in ('cmd.exe', 'powershell.exe'):
+            if proc.info['name'] and proc.info['name'].lower() in ('cmd.exe','powershell.exe'):
                 cmdline = proc.info['cmdline']
                 if cmdline and any(bat_path_norm == os.path.normcase(os.path.abspath(arg)) for arg in cmdline):
                     return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except Exception:
             continue
     return False
+
+
+def run_bat_process(bat_path):
+    working_dir = os.path.dirname(bat_path)
+    try:
+        subprocess.run(f'cmd /c call "{bat_path}"', cwd=working_dir)
+        return f"Выполнен: {bat_path}"
+    except Exception as e:
+        return f"Ошибка: {bat_path}, {e}"
 
 
 def is_sender_running(bat_path):
@@ -276,45 +266,31 @@ def is_sender_running(bat_path):
 
 def run_sender(disk, sender_folder_name):
     bat_path = os.path.join(f"{disk}\\", sender_folder_name, "videoToServer.bat")
-    
     if not os.path.exists(bat_path):
         log(f"Bat файл не найден: {bat_path}", level="error")
         return
 
-    if is_sender_running(bat_path):
+    if active_senders.get(disk, False):
         log(f"Отправщик для {disk} уже запущен", level="warning")
         return
 
-    log(f"Запуск отправщика для {disk}", level="success")
+    active_senders[disk] = True
     try:
         subprocess.Popen(
             f'start "" /D "{os.path.dirname(bat_path)}" cmd /c call "{bat_path}"',
             shell=True,
             creationflags=subprocess.CREATE_NEW_CONSOLE
         )
+        log(f"Запуск отправщика для {disk}", level="success")
     except Exception as e:
-        log(f"Ошибка: {e}", level="error")
+        log(f"Ошибка запуска отправщика {disk}: {e}", level="error")
+    finally:
+        active_senders[disk] = False
 
 active_senders = {}
 
 
-def run_sender_for_disk(disk, sender_folder_name):
-    if active_converters.get(disk, False):
-        log(f"Пропуск отправки для {disk} конвертер ещё работает", "warning")
-        return
-
-    if active_senders.get(disk, False):
-        log(f"Пропуск отправки для {disk}: сендер уже запущен", "warning")
-        return
-
-    active_senders[disk] = True
-    try:
-        run_sender(disk, sender_folder_name)
-    finally:
-        active_senders[disk] = False
-
-
-async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder_name, min_start_interval_sec):
+async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder_name, min_start_interval_sec, executor):
     global last_launch_time, last_skip_report
     now = time.time()
 
@@ -322,15 +298,12 @@ async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder
         return
 
     to_start = {}
-
     for ip, dest_path in ip_destinations.items():
-        disk_letter = os.path.splitdrive(dest_path)[0]
+        disk_letter = os.path.splitdrive(dest_path)[0].upper()
         if not disk_letter:
             continue
-        disk_letter = disk_letter.upper()
         backup_path = os.path.join(disk_letter + os.sep, "backupfile")
-        converter_folder_path = os.path.join(disk_letter + os.sep, converter_folder_name)
-        converter_bat = os.path.join(converter_folder_path, "start.bat")
+        converter_bat = os.path.join(disk_letter + os.sep, converter_folder_name, "start.bat")
 
         if not os.path.isdir(backup_path) or not os.path.exists(converter_bat):
             continue
@@ -341,29 +314,26 @@ async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder
 
         last_mod = last_modification_time(backup_path)
         if last_mod == 0 or (now - last_mod) >= idle_minutes * 60:
-            to_start[disk_letter] = (converter_bat, converter_folder_path)
+            to_start[disk_letter] = converter_bat
         else:
             if last_skip_report.get(disk_letter, 0) < last_launch_time:
                 log(f"На диске {disk_letter} были изменения менее {idle_minutes} минут назад — запуск конвертера пропущен", level="warning")
                 last_skip_report[disk_letter] = now
 
     if not to_start:
-        log("Нет конвертеров для запуска")
         last_launch_time = now
         return
 
     log(f"Запускаем конвертеры на дисках: {', '.join(to_start.keys())}", level="success")
 
-    for disk, (bat_path, working_dir) in to_start.items():
-        try:
-            subprocess.Popen(
-                f'start "" /D "{working_dir}" cmd /c call "{bat_path}"',
-                shell=True,
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            active_converters[disk] = {"bat_path": bat_path, "last_check": now}
-        except Exception as e:
-            log(f"Ошибка запуска конвертера {bat_path}: {e}", level="error")
+    futures = []
+    for disk, bat_path in to_start.items():
+        futures.append(executor.submit(run_bat_process, bat_path))
+        active_converters[disk] = {"bat_path": bat_path, "last_check": now}
+
+    # Ждём завершения всех запущенных конвертеров в пуле, не блокируя главный цикл asyncio
+    for future in futures:
+        asyncio.get_running_loop().run_in_executor(None, future.result)
 
     last_launch_time = now
 
@@ -397,10 +367,11 @@ def process_path_star(args):
 async def main_loop(executor):
     total_moved = 0
     loop = asyncio.get_running_loop()
+
     while True:
         moved_this_cycle = 0
         all_messages = []
-        tasks = []
+        tasks_list = []
 
         settings = config_state["settings"]
         stable_time = settings.get("stable_time", 3)
@@ -417,21 +388,20 @@ async def main_loop(executor):
             if not dest:
                 continue
             for base_path in main_paths:
-                tasks.append((base_path, ip, dest, stable_time))
+                tasks_list.append((base_path, ip, dest, stable_time))
 
-        if tasks:
+        if tasks_list:
             try:
-                results = await loop.run_in_executor(
-                    None,
-                    lambda: list(executor.map(process_path_star, tasks)),
-                )
+                futures = [loop.run_in_executor(executor, process_path_star, task) for task in tasks_list]
+                results = await asyncio.gather(*futures)
+
                 for moved, messages in results:
                     moved_this_cycle += moved
+                    all_messages.extend(messages)
                     for msg in messages:
                         log(msg, level="info")
             except Exception as e:
                 log(f"Ошибка пула процессов: {e}", level="error")
-                break
 
         total_moved += moved_this_cycle
         log(f"Цикл завершён. Перемещено файлов: {moved_this_cycle}, всего: {total_moved}", level="success")
@@ -440,71 +410,80 @@ async def main_loop(executor):
 
 async def command_loop():
     log("Командный режим включён. Введите 'help'", level="info")
-    loop = asyncio.get_running_loop()
+    session = PromptSession()
 
-    while True:
-        try:
-            cmd = await loop.run_in_executor(None, lambda: input(">> ").strip().lower())
+    with patch_stdout():
+        while True:
+            try:
+                cmd = await session.prompt_async(">> ")
+                cmd = cmd.strip().lower()
 
-            if cmd == "help":
-                print("""
-Доступные команды:
-  reload      - перезагрузить config.ini
-  vpn         - проверить VPN и перезапустить при необходимости
-  status      - показать активные процессы/отправщики
-  stop [ip]   - остановить отправку на указанный IP
-  start [ip]  - включить отправку на указанный IP
-  exit        - завершить скрипт
+                if cmd == "help":
+                    print("""Доступные команды:
+
+help                - показать доступные команды
+reload              - перезагрузить config.ini
+start convert       - принудительно запустить конверторы на всех дисках
+restart vpn         - принудительно перезапустить VPN
+status              - показать активные процессы/отправщики
+exit                - завершить скрипт
 """)
-            elif cmd == "reload":
-                update_config_state()
-                log("Настройки перезагружены вручную", level="success")
+                    
+                elif cmd == "reload":
+                    update_config_state()
+                    log("Настройки перезагружены вручную", level="success")
+                
+                elif cmd == "start convert":
+                    settings = config_state["settings"]
+                    await launch_idle_converters(
+                        config_state["ip_destinations"],
+                        settings["converter_idle_minutes"],
+                        settings["converter_folder_name"],
+                        0
+                    )
+                    log("Запуск конвертеров и отправщиков выполнен вручную", level="success")
 
-            elif cmd == "vpn":
-                s = config_state["settings"]
-                vpn_name = s.get("vpn_name", "")
-                vpn_user = s.get("vpn_user", "")
-                vpn_pass = s.get("vpn_pass", "")
-                if not vpn_name:
-                    log("VPN не настроен", level="warning")
-                elif not is_vpn_connected(vpn_name, vpn_user, vpn_pass):
+                elif cmd == "restart vpn":
+                    settings = config_state["settings"]
+                    vpn_name = settings.get("vpn_name", "")
+                    vpn_user = settings.get("vpn_user", "")
+                    vpn_pass = settings.get("vpn_pass", "")
                     restart_vpn(vpn_name, vpn_user, vpn_pass)
-                else:
-                    log("VPN подключён", level="success")
+                    log("Перезапуск VPN выполнен вручную", level="success")
 
-            elif cmd == "status":
-                log(f"Активные конвертеры: {list(active_converters.keys())}", level="info")
-                log(f"Активные отправщики: {list(active_senders.keys())}", level="info")
+                elif cmd == "status":
+                    conv_running = []
+                    for d, info in active_converters.items():
+                        if info and is_converter_process_running(info["bat_path"]):
+                            conv_running.append(d)
 
-            elif cmd.startswith("stop "):
-                ip = cmd.split(" ", 1)[1]
-                if ip in config_state["ip_switch"]:
-                    config_state["ip_switch"][ip] = False
-                    log(f"Отправка на {ip} отключена", level="warning")
-                else:
-                    log(f"IP {ip} не найден", level="error")
+                    send_running = []
+                    for d in active_senders.keys():
+                        bat_path = os.path.join(
+                            f"{d}\\",
+                            config_state["settings"]["sender_folder_name"],
+                            "videoToServer.bat"
+                        )
+                        if is_sender_running(bat_path):
+                            send_running.append(d)
 
-            elif cmd.startswith("start "):
-                ip = cmd.split(" ", 1)[1]
-                if ip in config_state["ip_switch"]:
-                    config_state["ip_switch"][ip] = True
-                    log(f"Отправка на {ip} включена", level="success")
-                else:
-                    log(f"IP {ip} не найден", level="error")
+                    log(f"Активные конвертеры: {conv_running}", level="info")
+                    log(f"Активные отправщики: {send_running}", level="info")
 
-            elif cmd == "exit":
-                log("Выход из программы...", level="warning")
-                os._exit(0)
 
-            elif cmd:
-                log(f"Неизвестная команда: {cmd}", level="error")
+                elif cmd == "exit":
+                    log("Выход из программы...", level="warning")
+                    os._exit(0)
 
-        except KeyboardInterrupt:
-            # Ctrl+C не убивает, просто очищает ввод
-            print()
-            continue
-        except Exception as e:
-            log(f"Ошибка в командном режиме: {e}", level="error")
+                elif cmd:
+                    log(f"Неизвестная команда: {cmd}", level="error")
+
+            except KeyboardInterrupt:
+                print()  # Ctrl+C очищает строку ввода
+                continue
+            except Exception as e:
+                log(f"Ошибка в командном режиме: {e}", level="error")
+
 
 
 async def main_async(tasks):
@@ -517,11 +496,12 @@ async def main_async(tasks):
 def main():
     update_config_state()
     settings = config_state["settings"]
-    max_workers = settings.get("max_workers", 2)
 
-    log("Старт перемещения файлов...")
+    cpu_workers = settings.get("cpu_workers", 1)  # берём из конфига
+    log(f"Используется CPU воркеров: {cpu_workers}", level="success")
 
-    executor = ProcessPoolExecutor(max_workers=max_workers)
+    executor = ProcessPoolExecutor(max_workers=cpu_workers)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
