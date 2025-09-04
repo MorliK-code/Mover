@@ -338,6 +338,22 @@ async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder
     last_launch_time = now
 
 
+def run_sender_for_disk(disk, sender_folder_name):
+    if active_converters.get(disk, False):
+        log(f"Пропуск отправки для {disk} конвертер ещё работает", "warning")
+        return
+
+    if active_senders.get(disk, False):
+        log(f"Пропуск отправки для {disk}: сендер уже запущен", "warning")
+        return
+
+    active_senders[disk] = True
+    try:
+        run_sender(disk, sender_folder_name)
+    finally:
+        active_senders[disk] = False
+
+
 async def monitor_converter_completion(check_interval_sec, sender_folder_name):
     while True:
         to_remove = []
