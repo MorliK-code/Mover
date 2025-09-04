@@ -150,35 +150,51 @@ def is_file_stable(path, min_stable_time):
 
 
 def process_ip_folder(args):
-    date_folder_path, ip_folder, ip, dest_base, min_stable_time = args
-    moved = 0
     messages = []
-    exclude_pattern = re.compile(r"^index\d+(\.bin)?$", re.IGNORECASE)
+    date_folder_path, ip_folder, ip, dest_base, min_stable_time = args
     src_ip_path = os.path.join(date_folder_path, ip_folder)
     if not os.path.isdir(src_ip_path):
         return 0, messages
+
+    moved = 0
+    exclude_pattern = re.compile(r"^index\d+(\.bin)?$", re.IGNORECASE)
+
     try:
         filenames = os.listdir(src_ip_path)
     except Exception as e:
-        messages.append(f"Ошибка чтения {src_ip_path}: {e}")
+        messages.append(f"Ошибка чтения каталога {src_ip_path}: {e}")
         return 0, messages
+
     for filename in filenames:
         if exclude_pattern.match(filename):
             continue
+
         file_path = os.path.join(src_ip_path, filename)
-        if not os.path.isfile(file_path) or not is_file_stable(file_path, min_stable_time):
+        if not os.path.isfile(file_path):
             continue
-        dst_dir = os.path.join(dest_base, os.path.basename(date_folder_path), ip_folder)
-        os.makedirs(dst_dir, exist_ok=True)
+
+        if not is_file_stable(file_path, min_stable_time):
+            continue
+
+        date_folder_name = os.path.basename(date_folder_path)
+        dst_dir = os.path.join(dest_base, date_folder_name, ip_folder)
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+        except Exception as e:
+            messages.append(f"Ошибка создания папки {dst_dir}: {e}")
+            continue
+
         dst_file_path = os.path.join(dst_dir, filename)
         try:
             if os.path.exists(dst_file_path):
                 os.remove(dst_file_path)
+
             shutil.move(file_path, dst_file_path)
-            moved += 1
             messages.append(f"Перемещён файл: {file_path} → {dst_file_path}")
+            moved += 1
         except Exception as e:
             messages.append(f"Ошибка при перемещении {file_path}: {e}")
+
     return moved, messages
 
 
@@ -187,32 +203,36 @@ def process_path(base_path, ip, dest, min_stable_time):
     all_messages = []
     if not os.path.isdir(base_path):
         return 0, all_messages
+
     try:
         date_folders = os.listdir(base_path)
     except Exception as e:
-        all_messages.append(f"Ошибка чтения папок {base_path}: {e}")
+        all_messages.append(f"Ошибка чтения папок в {base_path}: {e}")
         return 0, all_messages
+
     tasks = []
     for date_folder in date_folders:
         date_folder_path = os.path.join(base_path, date_folder)
         if not os.path.isdir(date_folder_path):
             continue
+
         try:
             ip_folders = os.listdir(date_folder_path)
         except Exception as e:
-            all_messages.append(f"Ошибка чтения папок {date_folder_path}: {e}")
+            all_messages.append(f"Ошибка чтения папок в {date_folder_path}: {e}")
             continue
+
         for ip_folder in ip_folders:
             if not ip_folder.startswith(ip):
                 continue
             tasks.append((date_folder_path, ip_folder, ip, dest, min_stable_time))
-    # Многопроцессный запуск для каждой папки
-    moved_results = []
-    with ProcessPoolExecutor() as executor:
-        moved_results = list(executor.map(process_ip_folder, tasks))
-    for moved, messages in moved_results:
-        total_moved += moved
-        all_messages.extend(messages)
+
+    with ThreadPoolExecutor() as thread_executor:
+        results = list(thread_executor.map(process_ip_folder, tasks))
+        for moved, messages in results:
+            total_moved += moved
+            all_messages.extend(messages)
+
     return total_moved, all_messages
 
 
@@ -231,24 +251,25 @@ def last_modification_time(path):
 
 def is_converter_process_running(bat_path):
     bat_path_norm = os.path.normcase(os.path.abspath(bat_path))
-    for proc in psutil.process_iter(['name','cmdline']):
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            if proc.info['name'] and proc.info['name'].lower() in ('cmd.exe','powershell.exe'):
+            if proc.info['name'] and proc.info['name'].lower() in ('cmd.exe', 'powershell.exe'):
                 cmdline = proc.info['cmdline']
                 if cmdline and any(bat_path_norm == os.path.normcase(os.path.abspath(arg)) for arg in cmdline):
                     return True
-        except Exception:
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return False
 
 
-def run_bat_process(bat_path):
-    working_dir = os.path.dirname(bat_path)
-    try:
-        subprocess.run(f'cmd /c call "{bat_path}"', cwd=working_dir)
-        return f"Выполнен: {bat_path}"
-    except Exception as e:
-        return f"Ошибка: {bat_path}, {e}"
+def run_sender_for_disk(disk, sender_folder_name):
+    if active_converters.get(disk, False):
+        log(f"Пропуск отправки для {disk} конвертер ещё работает", "warning")
+        return
+
+    if active_senders.get(disk, False):
+        log(f"Пропуск отправки для {disk}: сендер уже запущен", "warning")
+        return
 
 
 def is_sender_running(bat_path):
@@ -266,76 +287,26 @@ def is_sender_running(bat_path):
 
 def run_sender(disk, sender_folder_name):
     bat_path = os.path.join(f"{disk}\\", sender_folder_name, "videoToServer.bat")
+    
     if not os.path.exists(bat_path):
         log(f"Bat файл не найден: {bat_path}", level="error")
         return
 
-    if active_senders.get(disk, False):
+    if is_sender_running(bat_path):
         log(f"Отправщик для {disk} уже запущен", level="warning")
         return
 
-    active_senders[disk] = True
+    log(f"Запуск отправщика для {disk}", level="success")
     try:
         subprocess.Popen(
             f'start "" /D "{os.path.dirname(bat_path)}" cmd /c call "{bat_path}"',
             shell=True,
             creationflags=subprocess.CREATE_NEW_CONSOLE
         )
-        log(f"Запуск отправщика для {disk}", level="success")
     except Exception as e:
-        log(f"Ошибка запуска отправщика {disk}: {e}", level="error")
-    finally:
-        active_senders[disk] = False
+        log(f"Ошибка: {e}", level="error")
 
 active_senders = {}
-
-
-async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder_name, min_start_interval_sec, executor):
-    global last_launch_time, last_skip_report
-    now = time.time()
-
-    if now - last_launch_time < min_start_interval_sec:
-        return
-
-    to_start = {}
-    for ip, dest_path in ip_destinations.items():
-        disk_letter = os.path.splitdrive(dest_path)[0].upper()
-        if not disk_letter:
-            continue
-        backup_path = os.path.join(disk_letter + os.sep, "backupfile")
-        converter_bat = os.path.join(disk_letter + os.sep, converter_folder_name, "start.bat")
-
-        if not os.path.isdir(backup_path) or not os.path.exists(converter_bat):
-            continue
-
-        if is_converter_process_running(converter_bat):
-            active_converters[disk_letter] = {"bat_path": converter_bat, "last_check": now}
-            continue
-
-        last_mod = last_modification_time(backup_path)
-        if last_mod == 0 or (now - last_mod) >= idle_minutes * 60:
-            to_start[disk_letter] = converter_bat
-        else:
-            if last_skip_report.get(disk_letter, 0) < last_launch_time:
-                log(f"На диске {disk_letter} были изменения менее {idle_minutes} минут назад — запуск конвертера пропущен", level="warning")
-                last_skip_report[disk_letter] = now
-
-    if not to_start:
-        last_launch_time = now
-        return
-
-    log(f"Запускаем конвертеры на дисках: {', '.join(to_start.keys())}", level="success")
-
-    futures = []
-    for disk, bat_path in to_start.items():
-        futures.append(executor.submit(run_bat_process, bat_path))
-        active_converters[disk] = {"bat_path": bat_path, "last_check": now}
-
-    # Ждём завершения всех запущенных конвертеров в пуле, не блокируя главный цикл asyncio
-    for future in futures:
-        asyncio.get_running_loop().run_in_executor(None, future.result)
-
-    last_launch_time = now
 
 
 def run_sender_for_disk(disk, sender_folder_name):
@@ -352,6 +323,60 @@ def run_sender_for_disk(disk, sender_folder_name):
         run_sender(disk, sender_folder_name)
     finally:
         active_senders[disk] = False
+
+
+async def launch_idle_converters(ip_destinations, idle_minutes, converter_folder_name, min_start_interval_sec):
+    global last_launch_time, last_skip_report
+    now = time.time()
+
+    if now - last_launch_time < min_start_interval_sec:
+        return
+
+    to_start = {}
+
+    for ip, dest_path in ip_destinations.items():
+        disk_letter = os.path.splitdrive(dest_path)[0]
+        if not disk_letter:
+            continue
+        disk_letter = disk_letter.upper()
+        backup_path = os.path.join(disk_letter + os.sep, "backupfile")
+        converter_folder_path = os.path.join(disk_letter + os.sep, converter_folder_name)
+        converter_bat = os.path.join(converter_folder_path, "start.bat")
+
+        if not os.path.isdir(backup_path) or not os.path.exists(converter_bat):
+            continue
+
+        if is_converter_process_running(converter_bat):
+            active_converters[disk_letter] = {"bat_path": converter_bat, "last_check": now}
+            continue
+
+        last_mod = last_modification_time(backup_path)
+        if last_mod == 0 or (now - last_mod) >= idle_minutes * 60:
+            to_start[disk_letter] = (converter_bat, converter_folder_path)
+        else:
+            if last_skip_report.get(disk_letter, 0) < last_launch_time:
+                log(f"На диске {disk_letter} были изменения менее {idle_minutes} минут назад — запуск конвертера пропущен", level="warning")
+                last_skip_report[disk_letter] = now
+
+    if not to_start:
+        log("Нет конвертеров для запуска")
+        last_launch_time = now
+        return
+
+    log(f"Запускаем конвертеры на дисках: {', '.join(to_start.keys())}", level="success")
+
+    for disk, (bat_path, working_dir) in to_start.items():
+        try:
+            subprocess.Popen(
+                f'start "" /D "{working_dir}" cmd /c call "{bat_path}"',
+                shell=True,
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            active_converters[disk] = {"bat_path": bat_path, "last_check": now}
+        except Exception as e:
+            log(f"Ошибка запуска конвертера {bat_path}: {e}", level="error")
+
+    last_launch_time = now
 
 
 async def monitor_converter_completion(check_interval_sec, sender_folder_name):
